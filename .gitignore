@@ -1,0 +1,15 @@
+# Secrets — never commit
+.env
+
+# Local data (SQLite database with scanned items and cached Gemini results)
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editors / OS
+.DS_Store
+.vscode/

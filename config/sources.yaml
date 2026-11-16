@@ -1,0 +1,36 @@
+# Public sources TrendScan scans. Add, remove, or disable entries here — no code change needed.
+#
+#   id:        short unique key (used in item IDs — don't rename once data exists)
+#   name:      shown in the UI
+#   type:      "rss" (RSS/Atom feed) or "arxiv" (arXiv API, Atom with paper metadata)
+#   url:       feed / API endpoint
+#   publisher: (optional) publisher name to show instead of the feed's title
+#   kind:      news | paper | report — tells Gemini what kind of evidence it is reading
+#   max_items: how many of the newest entries to take per scan
+#   enabled:   set false to skip without deleting
+
+sources:
+  - id: arxiv-cs-ai
+    name: arXiv – Artificial Intelligence (cs.AI)
+    type: arxiv
+    url: https://export.arxiv.org/api/query?search_query=cat:cs.AI&sortBy=submittedDate&sortOrder=descending&max_results=10
+    kind: paper
+    max_items: 10
+    enabled: true
+
+  - id: mit-tr-ai
+    name: MIT Technology Review – AI
+    type: rss
+    url: https://www.technologyreview.com/topic/artificial-intelligence/feed
+    kind: news
+    max_items: 10
+    enabled: true
+
+  - id: bis-publications
+    name: BIS and FSI publications
+    type: rss
+    url: https://www.bis.org/doclist/bis_fsi_publs.rss
+    publisher: Bank for International Settlements (BIS)   # optional: overrides the feed title
+    kind: report
+    max_items: 10
+    enabled: true

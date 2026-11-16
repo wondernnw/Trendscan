@@ -1,0 +1,49 @@
+# FICTIONAL trend profiles for the TrendScan prototype.
+# These are invented examples, NOT the Bundesbank technology trend radar.
+# Everything in this file is sent to Gemini (free tier), so keep it non-confidential.
+#
+# Bump `version` whenever you edit profiles: cached Gemini results are tied to this
+# version, so a bump makes the next scan re-assess items against the new profiles.
+
+version: 1
+
+profiles:
+  - id: agentic-ai
+    name: Agentic AI systems
+    ring: assess          # fictional radar ring: adopt | trial | assess | hold
+    description: >
+      AI systems that plan and execute multi-step tasks autonomously using tools,
+      APIs and other agents, including their evaluation, reliability and governance.
+    keywords: [AI agents, tool use, autonomous workflows, multi-agent, agent evaluation]
+
+  - id: efficient-models
+    name: Small and efficient language models
+    ring: trial
+    description: >
+      Compact or distilled language models that run on-premises or on edge devices at
+      lower cost, relevant where data must not leave the organisation.
+    keywords: [small language models, distillation, quantization, on-device, open-weight]
+
+  - id: post-quantum-crypto
+    name: Post-quantum cryptography migration
+    ring: assess
+    description: >
+      Transition of cryptographic infrastructure to quantum-resistant algorithms,
+      including standards, migration planning and crypto-agility.
+    keywords: [post-quantum, PQC, quantum-safe, crypto-agility, NIST standards]
+
+  - id: tokenisation
+    name: Tokenisation of money and assets
+    ring: assess
+    description: >
+      Representation of financial assets, deposits or central bank money on
+      programmable ledgers, including unified ledgers and settlement infrastructure.
+    keywords: [tokenisation, tokenized deposits, stablecoins, CBDC, unified ledger, DLT settlement]
+
+  - id: ai-assurance
+    name: AI assurance and model risk
+    ring: trial
+    description: >
+      Methods to test, explain, monitor and govern AI models in regulated settings,
+      including hallucination control, robustness and auditability.
+    keywords: [AI governance, model risk, explainability, evaluation, AI regulation, red teaming]
