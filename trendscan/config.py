@@ -1,7 +1,7 @@
 """Central settings. Every other module gets configuration from here.
 
 Settings come from environment variables (optionally loaded from a local .env file).
-The API key is read here and nowhere else, and is never printed or logged.
+The API key and the mail password are read here and nowhere else, and are never printed or logged.
 """
 
 from __future__ import annotations
@@ -34,11 +34,24 @@ class Settings:
     pdf_timeout_seconds: float = 120   # time limit for one PDF download
     max_doc_seconds_per_scan: float = 300   # time budget for all PDF downloads in one scan
     revision_check_days: int = 90      # look for new versions of items first seen in this many days
+    # Scheduled scans run unattended, so slow PDF servers can be given more time.
+    scheduled_pdf_timeout_seconds: float = 300
+    scheduled_doc_seconds_per_scan: float = 1200
     db_path: Path = DATA_DIR / "trendscan.db"
     sources_file: Path = CONFIG_DIR / "sources.yaml"
     profiles_file: Path = CONFIG_DIR / "trend_profiles.yaml"
-    # repr=False keeps the key out of print(settings), logs and tracebacks.
+    # Email digest. "test" saves each digest to data/digests/ and sends nothing;
+    # "smtp" sends it through the mail server below.
+    email_mode: str = "test"
+    email_to: tuple[str, ...] = ()
+    email_from: str = "TrendScan <trendscan@localhost>"
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    digest_dir: Path = DATA_DIR / "digests"
+    # repr=False keeps secrets out of print(settings), logs and tracebacks.
     gemini_api_key: str | None = field(default=None, repr=False)
+    smtp_password: str | None = field(default=None, repr=False)
 
     @property
     def gemini_configured(self) -> bool:
@@ -57,8 +70,19 @@ def load_settings() -> Settings:
         pdf_timeout_seconds=float(env.get("TRENDSCAN_PDF_TIMEOUT_SECONDS", Settings.pdf_timeout_seconds)),
         max_doc_seconds_per_scan=float(env.get("TRENDSCAN_MAX_DOC_SECONDS_PER_SCAN", Settings.max_doc_seconds_per_scan)),
         revision_check_days=int(env.get("TRENDSCAN_REVISION_CHECK_DAYS", Settings.revision_check_days)),
+        scheduled_pdf_timeout_seconds=float(env.get("TRENDSCAN_SCHEDULED_PDF_TIMEOUT_SECONDS",
+                                                    Settings.scheduled_pdf_timeout_seconds)),
+        scheduled_doc_seconds_per_scan=float(env.get("TRENDSCAN_SCHEDULED_DOC_SECONDS_PER_SCAN",
+                                                     Settings.scheduled_doc_seconds_per_scan)),
         db_path=Path(env.get("TRENDSCAN_DB_PATH", Settings.db_path)),
+        email_mode=env.get("TRENDSCAN_EMAIL_MODE", Settings.email_mode).strip().lower(),
+        email_to=tuple(a.strip() for a in env.get("TRENDSCAN_EMAIL_TO", "").split(",") if a.strip()),
+        email_from=env.get("TRENDSCAN_EMAIL_FROM", Settings.email_from),
+        smtp_host=env.get("TRENDSCAN_SMTP_HOST") or None,
+        smtp_port=int(env.get("TRENDSCAN_SMTP_PORT", Settings.smtp_port)),
+        smtp_user=env.get("TRENDSCAN_SMTP_USER") or None,
         gemini_api_key=env.get("GEMINI_API_KEY") or None,
+        smtp_password=env.get("TRENDSCAN_SMTP_PASSWORD") or None,
     )
 
 

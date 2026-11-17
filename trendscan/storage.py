@@ -6,6 +6,10 @@ Tables:
   documents         — current full text (per page) of a paper/report PDF, or why it is unavailable.
   document_versions — archive: the page texts of every version of a document we have read.
   version_changes   — comparison of two consecutive versions (local diff + Gemini summary).
+  scan_runs         — history of scans (manual or scheduled) with their report.
+  digests           — email digests saved (test mode) or sent, and which entries each reported.
+  edition_links     — a new edition of a recurring publication, linked to the previous edition,
+                      with the comparison of the two.
 """
 
 from __future__ import annotations
@@ -86,6 +90,44 @@ CREATE TABLE IF NOT EXISTS version_changes (
     model       TEXT,
     compared_at TEXT NOT NULL,
     PRIMARY KEY (item_id, new_no)
+);
+
+CREATE TABLE IF NOT EXISTS edition_links (
+    new_item_id TEXT PRIMARY KEY REFERENCES items(item_id),
+    old_item_id TEXT NOT NULL REFERENCES items(item_id),
+    series_key  TEXT NOT NULL,     -- title without edition marker, e.g. "bis annual economic report"
+    reason      TEXT NOT NULL,     -- why the two were linked (shown to the user)
+    status      TEXT NOT NULL,     -- waiting | unavailable | pending | done | failed
+    cache_key   TEXT,              -- both text hashes + model + prompt version
+    stats       TEXT,              -- JSON: pages compared per edition
+    result      TEXT,              -- JSON from Gemini (when done)
+    error       TEXT,              -- why not compared (unavailable/failed/pending)
+    model       TEXT,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS digests (
+    digest_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  TEXT NOT NULL,
+    mode        TEXT NOT NULL,     -- test (saved to a file) | smtp (sent)
+    subject     TEXT NOT NULL,
+    entries     INTEGER NOT NULL,
+    location    TEXT NOT NULL      -- file path (test) or recipients (smtp)
+);
+
+CREATE TABLE IF NOT EXISTS digest_entries (
+    entry_key   TEXT PRIMARY KEY,  -- e.g. "item:<id>", "version:<id>:<n>", "edition:<new>:<old>"
+    digest_id   INTEGER NOT NULL REFERENCES digests(digest_id)
+);
+
+CREATE TABLE IF NOT EXISTS scan_runs (
+    run_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger     TEXT NOT NULL,     -- manual | scheduled
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    status      TEXT NOT NULL,     -- running | ok | error | interrupted
+    report      TEXT,              -- JSON of the ScanReport (when finished)
+    error       TEXT
 );
 """
 
@@ -301,6 +343,97 @@ class Store:
                 (item_id, old_no, new_no, cache_key, status, json.dumps(stats),
                  json.dumps(result) if result is not None else None, error, model, now_iso()),
             )
+
+    # ----- editions -----
+
+    def get_edition_links(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM edition_links").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["stats"] = json.loads(d["stats"]) if d["stats"] else None
+            d["result"] = json.loads(d["result"]) if d["result"] else None
+            out.append(d)
+        return out
+
+    def save_edition_link(self, new_item_id: str, old_item_id: str, series_key: str, reason: str,
+                          status: str, cache_key: str | None = None, stats: dict | None = None,
+                          model: str | None = None, result: dict | None = None,
+                          error: str | None = None) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO edition_links (new_item_id, old_item_id, series_key, reason, status,
+                       cache_key, stats, model, result, error, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(new_item_id) DO UPDATE SET old_item_id=excluded.old_item_id,
+                       series_key=excluded.series_key, reason=excluded.reason, status=excluded.status,
+                       cache_key=excluded.cache_key, stats=excluded.stats, result=excluded.result,
+                       error=excluded.error, model=excluded.model, updated_at=excluded.updated_at""",
+                (new_item_id, old_item_id, series_key, reason, status, cache_key,
+                 json.dumps(stats) if stats is not None else None, model,
+                 json.dumps(result) if result is not None else None, error, now_iso()),
+            )
+
+    def delete_edition_link(self, new_item_id: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM edition_links WHERE new_item_id = ?", (new_item_id,))
+
+    # ----- email digests -----
+
+    def reported_keys(self) -> set[str]:
+        with self._conn() as c:
+            return {r["entry_key"] for r in c.execute("SELECT entry_key FROM digest_entries")}
+
+    def record_digest(self, mode: str, subject: str, location: str, keys: list[str]) -> int:
+        """Remember a saved/sent digest and the entries it reported (so they are not repeated)."""
+        with self._conn() as c:
+            cur = c.execute("INSERT INTO digests (created_at, mode, subject, entries, location) VALUES (?,?,?,?,?)",
+                            (now_iso(), mode, subject, len(keys), location))
+            c.executemany("INSERT OR IGNORE INTO digest_entries VALUES (?,?)",
+                          [(k, cur.lastrowid) for k in keys])
+            return cur.lastrowid
+
+    def recent_digests(self, limit: int = 5) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute("SELECT * FROM digests ORDER BY digest_id DESC LIMIT ?", (limit,))]
+
+    def done_changes(self) -> list[dict]:
+        """Version comparisons summarized by Gemini (newest version per document)."""
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM version_changes WHERE status = 'done'").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["result"] = json.loads(d["result"]) if d["result"] else None
+            out.append(d)
+        return out
+
+    # ----- scan history -----
+
+    def start_run(self, trigger: str) -> int:
+        with self._conn() as c:
+            # Only one scan can run at a time (see runs.scan_lock). A row still marked
+            # "running" therefore belongs to a scan whose process ended without finishing.
+            c.execute("UPDATE scan_runs SET status='interrupted', finished_at=? WHERE status='running'",
+                      (now_iso(),))
+            cur = c.execute("INSERT INTO scan_runs (trigger, started_at, status) VALUES (?,?,'running')",
+                            (trigger, now_iso()))
+            return cur.lastrowid
+
+    def finish_run(self, run_id: int, status: str, report: dict | None, error: str | None = None) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE scan_runs SET finished_at=?, status=?, report=?, error=? WHERE run_id=?",
+                      (now_iso(), status, json.dumps(report) if report is not None else None, error, run_id))
+
+    def recent_runs(self, limit: int = 10) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM scan_runs ORDER BY run_id DESC LIMIT ?", (limit,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["report"] = json.loads(d["report"]) if d["report"] else None
+            out.append(d)
+        return out
 
     # ----- inbox -----
 

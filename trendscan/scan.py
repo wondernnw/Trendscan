@@ -1,4 +1,4 @@
-"""One manual scan: fetch sources -> store items -> fetch documents -> analyse what needs analysing."""
+"""One scan: fetch sources -> store items -> fetch documents -> analyse -> compare versions and editions."""
 
 from __future__ import annotations
 
@@ -12,8 +12,9 @@ from .analysis import (EVIDENCE_CHECK_VERSION, AnalysisFailed, GeminiAnalyzer, G
                        cache_key, check_evidence)
 from .config import Settings, load_profiles, load_sources
 from .documents import fetch_document, paged_text, pdf_signature
+from .editions import EditionComparison, build_edition_prompt, edition_cache_key, find_edition_links
 from .sources import fetch_arxiv_latest, fetch_source
-from .storage import Store
+from .storage import Store, text_hash
 from .versions import (VersionChanges, build_changes_prompt, changes_cache_key, check_changes,
                        diff_versions, hunks_text)
 
@@ -46,6 +47,9 @@ class ScanReport:
     versions_added: int = 0        # new versions whose text was read and archived in this scan
     change_summaries: int = 0      # version comparisons summarized by Gemini in this scan
     changes_pending: int = 0       # comparisons still waiting for their Gemini summary
+    editions_linked: int = 0       # new editions linked to a previous edition in the inbox
+    edition_comparisons: int = 0   # edition comparisons made by Gemini in this scan
+    editions_pending: int = 0      # edition comparisons waiting for a PDF or for Gemini
 
 
 def run_scan(settings: Settings, store: Store, analyzer: GeminiAnalyzer | None = None,
@@ -99,7 +103,8 @@ def run_scan(settings: Settings, store: Store, analyzer: GeminiAnalyzer | None =
             sleep(SECONDS_BETWEEN_DOWNLOADS)
         progress(f"Reading PDF: {item.title[:60]} …")
         doc = fetch_document(item, settings.max_pdf_mb, settings.pdf_timeout_seconds)
-        attempts_this_scan += 1
+        if doc.status != "no_pdf":     # "no PDF on this page" cost one page request, not a download
+            attempts_this_scan += 1
         if same_ref and meta["refetch"] and meta["status"] == "ok" and doc.status != "ok":
             report.docs_failed += 1                # keep the readable copy we have; try again next scan
             continue
@@ -220,6 +225,67 @@ def run_scan(settings: Settings, store: Store, analyzer: GeminiAnalyzer | None =
             report.changes_pending += 1
         except AnalysisFailed as exc:
             save("failed", error=str(exc))
+            report.failed += 1
+
+    # 6) Editions: link a new edition of a recurring report to the previous one and compare them.
+    links = find_edition_links(store.inbox())                 # local rule, no network, no Gemini
+    stored_links = {l["new_item_id"]: l for l in store.get_edition_links()}
+    for gone in set(stored_links) - {l["new_item_id"] for l in links}:
+        store.delete_edition_link(gone)                       # no longer matches the rule
+    report.editions_linked = len(links)
+    for link in links:
+        new_id, old_id = link["new_item_id"], link["old_item_id"]
+        stored = stored_links.get(new_id)
+
+        def save_link(status, **extra):
+            store.save_edition_link(new_id, old_id, link["series_key"], link["reason"], status, **extra)
+
+        metas = {"previous": store.get_document_meta(old_id), "new": store.get_document_meta(new_id)}
+        waiting = [side for side, m in metas.items()
+                   if not m or (m["status"] == "inaccessible" and m["attempts"] < MAX_DOC_ATTEMPTS)]
+        if waiting:
+            save_link("waiting", error=f"The PDF of the {' and '.join(waiting)} edition has not been read yet.")
+            report.editions_pending += 1
+            continue
+        unreadable = [f"{side} edition: {m['status']} ({m['detail'] or 'no detail'})"
+                      for side, m in metas.items() if m["status"] != "ok"]
+        if unreadable:
+            save_link("unavailable", error="Cannot compare, a PDF could not be read. " + "; ".join(unreadable))
+            continue
+        old_pages = store.get_document(old_id).pages
+        new_pages = store.get_document(new_id).pages
+        key = edition_cache_key(text_hash(old_pages), text_hash(new_pages), settings.gemini_model,
+                                settings.max_doc_chars)
+        if stored and stored["old_item_id"] == old_id and stored["cache_key"] == key and stored["status"] == "done":
+            continue                                          # already compared: reuse
+        old_text, old_sent = paged_text(old_pages, settings.max_doc_chars // 2)   # half the budget each
+        new_text, new_sent = paged_text(new_pages, settings.max_doc_chars // 2)
+        stats = {"old_pages_sent": old_sent, "old_pages": len(old_pages),
+                 "new_pages_sent": new_sent, "new_pages": len(new_pages)}
+        if report.gemini_stopped or attempts >= settings.max_analyses_per_scan:
+            save_link("pending", cache_key=key, stats=stats, error="waiting for Gemini")
+            report.editions_pending += 1
+            continue
+        if attempts:
+            sleep(settings.seconds_between_calls)
+        attempts += 1
+        old_item, new_item = store.get_item(old_id), store.get_item(new_id)
+        progress(f"Comparing editions: {new_item.title[:60]} …")
+        prompt = build_edition_prompt(old_item, new_item, old_text, old_sent, len(old_pages),
+                                      new_text, new_sent, len(new_pages))
+        try:
+            if analyzer.client is not None:
+                report.gemini_calls += 1
+            result = check_changes(analyzer.generate(prompt, EditionComparison).model_dump(),
+                                   old_pages, new_pages)
+            save_link("done", cache_key=key, stats=stats, model=settings.gemini_model, result=result)
+            report.edition_comparisons += 1
+        except GeminiUnavailable as exc:
+            report.gemini_stopped = str(exc)
+            save_link("pending", cache_key=key, stats=stats, error=str(exc))
+            report.editions_pending += 1
+        except AnalysisFailed as exc:
+            save_link("failed", cache_key=key, stats=stats, error=str(exc))
             report.failed += 1
 
     return report

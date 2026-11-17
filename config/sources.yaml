@@ -34,3 +34,31 @@ sources:
     kind: report
     max_items: 10
     enabled: true
+
+  # Recurring publications: new editions are linked to the previous edition and compared.
+  - id: bis-aer
+    name: BIS Annual Economic Report
+    type: rss
+    url: https://www.bis.org/doclist/annualeconomicreports.rss
+    publisher: Bank for International Settlements (BIS)   # same as above, so editions match
+    kind: report
+    max_items: 2          # the feed lists every edition since 2018; 2 = current and previous
+    enabled: true
+
+  - id: fsb
+    name: Financial Stability Board
+    type: rss
+    url: https://www.fsb.org/feed/
+    publisher: Financial Stability Board (FSB)
+    kind: report          # reports and press releases; press releases have no PDF (analysed from the summary)
+    max_items: 10
+    enabled: true
+
+  - id: ecb-publications
+    name: ECB publications
+    type: rss
+    url: https://www.ecb.europa.eu/rss/pub.html
+    publisher: European Central Bank (ECB)
+    kind: report          # working papers come as PDF; many articles are web pages (analysed from the summary)
+    max_items: 10
+    enabled: true

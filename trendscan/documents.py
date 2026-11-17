@@ -7,6 +7,7 @@ whose `status` says what happened, so the scan can flag the problem and carry on
 from __future__ import annotations
 
 import io
+import logging
 import re
 import time
 import unicodedata
@@ -17,6 +18,10 @@ from urllib.parse import urljoin, urlsplit
 import requests
 
 from .sources import USER_AGENT, Item, canonical_url
+
+# pypdf warns about fonts it cannot fully decode (seen for math formulas in BIS reports).
+# The affected characters show up as "�" in the extracted text; the warnings only clutter the log.
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 MAX_PAGES = 300            # never extract more pages than this from one PDF
 MIN_TEXT_CHARS = 500       # less text than this in the whole PDF -> treat as scanned / no text layer
@@ -40,6 +45,9 @@ class _TooLarge(Exception):
 
 # ---------- finding the PDF ----------
 
+FULL_TEXT_LABEL = re.compile(r"\bfull[\s-]+(?:text|report)\b", flags=re.I)
+
+
 def discover_pdf_url(page_url: str, timeout_s: float = 120) -> str | None:
     """Find the PDF that belongs to a publication page.
 
@@ -49,7 +57,9 @@ def discover_pdf_url(page_url: str, timeout_s: float = 120) -> str | None:
       2. the page's `citation_pdf_url` meta tag
       3. the only PDF link on the page that is on the same host (BIS sometimes shortens
          the file name, e.g. "ready-run" for the page "ready-to-run")
-    If the page links several PDFs and none matches 1 or 2, we take none.
+      4. among several same-host PDFs, the only one whose link text says "full text" or
+         "full report" (FSB pages also link related documents, e.g. last year's methodology)
+    Otherwise we take none.
     """
     if page_url.lower().endswith(".pdf"):
         return page_url
@@ -62,7 +72,13 @@ def discover_pdf_url(page_url: str, timeout_s: float = 120) -> str | None:
     if meta:
         return urljoin(page_url, meta.group(1))
     same_host = [u for u in links if urlsplit(u).netloc == urlsplit(expected).netloc]
-    return same_host[0] if len(same_host) == 1 else None
+    if len(same_host) == 1:
+        return same_host[0]
+    labelled = {canonical_url(urljoin(page_url, href))
+                for href, text in re.findall(r'<a[^>]+href="([^"]+\.pdf)"[^>]*>(.*?)</a>', html, flags=re.I | re.S)
+                if FULL_TEXT_LABEL.search(re.sub(r"<[^>]+>", " ", text))}
+    labelled &= set(same_host)
+    return labelled.pop() if len(labelled) == 1 else None
 
 
 # ---------- downloading ----------

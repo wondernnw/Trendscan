@@ -7,9 +7,20 @@ from __future__ import annotations
 
 import streamlit as st
 
+from datetime import datetime
+from pathlib import Path
+
+import streamlit.components.v1 as components
+
+from trendscan import schedule
 from trendscan.config import load_profiles, load_settings, load_sources
-from trendscan.scan import run_scan
+from trendscan.runs import ScanBusy, report_from_dict, run_and_record
 from trendscan.storage import Store
+
+
+def local_time(iso: str | None) -> str:
+    """Stored timestamps are UTC; show them in the computer's local time."""
+    return datetime.fromisoformat(iso).astimezone().strftime("%d %b %Y, %H:%M") if iso else "–"
 
 st.set_page_config(page_title="TrendScan", page_icon="🔭", layout="wide")
 
@@ -23,11 +34,29 @@ with st.sidebar:
     st.title("🔭 TrendScan")
     st.caption("Prototype · public sources · fictional trend profiles")
 
-    if st.button("Run scan", type="primary", use_container_width=True):
+    if st.button("Run scan", type="primary", width="stretch"):
         with st.status("Scanning …", expanded=True) as status:
-            report = run_scan(settings, store, progress=status.write)
-            status.update(label="Scan finished", state="complete", expanded=False)
-        st.session_state["last_report"] = report
+            try:
+                run_and_record(settings, store, "manual", progress=status.write)
+                status.update(label="Scan finished", state="complete", expanded=False)
+            except ScanBusy:
+                status.update(label="Another scan is already running", state="error", expanded=False)
+                st.warning("A scan is already running (possibly the scheduled one). "
+                           "Its results appear here when it finishes; reload the page then.")
+
+    sched = schedule.status()
+    if sched:
+        days = "Mon–Fri" if sched["weekdays_only"] else "daily"
+        st.caption(f"⏰ Scheduled scan: {days} at {sched['time']}"
+                   + ("" if sched["loaded"] else " · ⚠️ installed but not active"))
+    else:
+        st.caption("⏰ No scheduled scan · `python -m trendscan schedule install --time 07:00`")
+    last_digest = next(iter(store.recent_digests(1)), None)
+    mode = ("test mode, saved, not sent" if settings.email_mode == "test"
+            else f"sent to {', '.join(settings.email_to) or '⚠️ no recipient set'}")
+    st.caption(f"📧 Email digest ({mode}): " + (
+        f"last {local_time(last_digest['created_at'])}, {last_digest['entries']} entries"
+        if last_digest else "none yet · created after each scheduled scan"))
 
     st.divider()
     st.markdown(f"**Gemini model:** `{settings.gemini_model}`")
@@ -42,9 +71,20 @@ with st.sidebar:
             st.markdown(f"- **{p['name']}** · _{p.get('ring', '')}_  \n  {p['description'].strip()}")
 
 # ---------------- last scan report ----------------
-report = st.session_state.get("last_report")
-if report:
+runs = store.recent_runs(10)
+last = next((r for r in runs if r["status"] != "running"), None)
+running = next((r for r in runs if r["status"] == "running"), None)
+if running:
+    st.info(f"A {running['trigger']} scan has been running since {local_time(running['started_at'])}. "
+            "Reload the page later to see its results.")
+report = report_from_dict(last["report"]) if last and last["report"] else None
+if last and last["status"] != "ok":
     st.subheader("Last scan")
+    st.error(f"The last {last['trigger']} scan ({local_time(last['started_at'])}) did not finish: "
+             f"{last['status']}{' — ' + last['error'] if last['error'] else ''}. "
+             "Items collected before that are shown; the next scan continues where it stopped.")
+if report:
+    st.subheader(f"Last scan · {last['trigger']} · {local_time(last['finished_at'])}")
     c = st.columns(7)
     c[0].metric("Fetched", report.fetched)
     c[1].metric("New items", report.new)
@@ -60,6 +100,9 @@ if report:
         st.caption(f"Revision check: {report.revisions_checked} papers/reports checked, "
                    f"{report.revisions_found} changed at the source, {report.versions_added} new versions read, "
                    f"{report.change_summaries} comparisons summarized, {report.changes_pending} waiting.")
+    if report.editions_linked:
+        st.caption(f"Editions: {report.editions_linked} new editions linked to their previous edition, "
+                   f"{report.edition_comparisons} compared in this scan, {report.editions_pending} waiting.")
     if report.docs_failed:
         st.warning(f"{report.docs_failed} PDFs could not be read in this scan. "
                    "The affected items are flagged in the inbox.")
@@ -68,6 +111,20 @@ if report:
                    "pending items are analysed on the next scan.")
     for name, err in report.source_errors.items():
         st.error(f"Source unavailable: **{name}** — {err}")
+if runs:
+    with st.expander(f"Scan history (last {len(runs)})"):
+        st.dataframe(
+            [{"Started": local_time(r["started_at"]), "Trigger": r["trigger"], "Status": r["status"],
+              "New": (r["report"] or {}).get("new"), "PDFs read": (r["report"] or {}).get("docs_fetched"),
+              "Gemini calls": (r["report"] or {}).get("gemini_calls"),
+              "Pending": (r["report"] or {}).get("pending"), "Error": r["error"] or ""}
+             for r in runs],
+            hide_index=True, width="stretch")
+
+if last_digest and last_digest["mode"] == "test" and Path(last_digest["location"]).exists():
+    with st.expander(f"Last email digest: {last_digest['subject']}"):
+        st.caption(f"Test mode: saved as {last_digest['location']} (and .eml); not sent.")
+        components.html(Path(last_digest["location"]).read_text(encoding="utf-8"), height=600, scrolling=True)
 
 # ---------------- inbox ----------------
 rows = store.inbox()
@@ -93,7 +150,12 @@ cat_filter = f1.multiselect("Show", ["Matches a trend", "Emerging signal", "No m
 src_filter = f2.multiselect("Source", sorted({r["source_name"] for r in rows}))
 query = f3.text_input("Search title / summary")
 revised = set(store.items_with_revisions())
-only_revised = st.checkbox(f"Only items with a new version ({len(revised)})") if revised else False
+editions = {l["new_item_id"]: l for l in store.get_edition_links()}
+newer_edition = {l["old_item_id"]: l["new_item_id"] for l in editions.values()}
+by_id = {r["item_id"]: r for r in rows}
+c1, c2 = st.columns(2)
+only_revised = c1.checkbox(f"Only items with a new version ({len(revised)})") if revised else False
+only_editions = c2.checkbox(f"Only new editions of a series ({len(editions)})") if editions else False
 
 shown = [
     r for r in rows
@@ -101,6 +163,7 @@ shown = [
     and (not src_filter or r["source_name"] in src_filter)
     and (not query or query.lower() in (r["title"] + " " + (r["summary"] or "")).lower())
     and (not only_revised or r["item_id"] in revised)
+    and (not only_editions or r["item_id"] in editions)
 ]
 st.caption(f"Showing {len(shown)} of {len(rows)}")
 
@@ -165,18 +228,55 @@ def render_versions(item_id: str) -> None:
     with st.expander(f"Changes in detail ({len(res['changes'])})", expanded=res["substantive"]):
         if s.get("changes_shown", s["changes"]) < s["changes"]:
             st.caption(f"Gemini saw the first {s['changes_shown']} of {s['changes']} differing passages.")
-        for ch in res["changes"]:
-            lines = [f"**{ch['description']}** · {ch['kind']} · significance _{ch['significance']}_"]
-            for side, version in (("old", old), ("new", new)):
-                quote, status = ch[f"{side}_quote"].strip(), ch[f"{side}_status"]
-                if not quote:
-                    continue
-                mark = {"verified": "✅", "other_page": "✅", "spans_pages": "✅", "near_match": "🟡 close match"}.get(
-                    status, "⚠️ not found in this version")
-                where = page_link(version["label"], version["pdf_url"], ch[f"{side}_page"]) if status not in (
-                    "not_found", "too_short") else version["label"]
-                lines.append(f"{where} {mark}\n\n> {quote}")
-            st.markdown("\n\n".join(lines))
+        render_change_list(res["changes"], {"old": (old["label"], old["pdf_url"]),
+                                            "new": (new["label"], new["pdf_url"])})
+
+
+def render_change_list(changes: list[dict], sides: dict[str, tuple[str, str | None]]) -> None:
+    """Changes between two versions or editions, each quote with TrendScan's check of it.
+    `sides` maps "old"/"new" to (label, PDF link)."""
+    for ch in changes:
+        lines = [f"**{ch['description']}** · {ch['kind']} · significance _{ch['significance']}_"]
+        for side, (label, pdf_url) in sides.items():
+            quote, status = ch[f"{side}_quote"].strip(), ch[f"{side}_status"]
+            if not quote:
+                continue
+            mark = {"verified": "✅", "other_page": "✅", "spans_pages": "✅", "near_match": "🟡 close match"}.get(
+                status, f"⚠️ not found in the {label}")
+            where = page_link(label, pdf_url, ch[f"{side}_page"]) if status not in (
+                "not_found", "too_short") else label
+            lines.append(f"{where} {mark}\n\n> {quote}")
+        st.markdown("\n\n".join(lines))
+
+
+def render_edition(link: dict, new_pdf: str | None) -> None:
+    """New edition of a recurring publication: link to the previous edition and the comparison."""
+    prev = by_id.get(link["old_item_id"])
+    if not prev:
+        return
+    prev_pdf = prev["doc_pdf_url"] or prev["pdf_url"]
+    st.markdown(f"**📚 New edition. Previous edition: [{prev['title']}]({prev['url']}) ↗** "
+                f"({(prev['published'] or '')[:10] or 'date unknown'})")
+    st.caption(f"Linked by TrendScan because: {link['reason']}.")
+    if link["status"] in ("waiting", "unavailable", "pending", "failed"):
+        icon = {"waiting": "⏳", "pending": "⏳", "unavailable": "⚠️", "failed": "⚠️"}[link["status"]]
+        note = {"waiting": " Comparison follows once both PDFs are read.",
+                "pending": " Retried on the next scan.", "failed": " Retried on the next scan.",
+                "unavailable": ""}[link["status"]]
+        st.info(f"{icon} Editions not compared yet: {link['error'] or link['status']}.{note}")
+        return
+    res, s = link["result"], link["stats"]
+    st.markdown(res["summary"])
+    if res["continuing_themes"]:
+        st.markdown("**Continuing themes:** " + " · ".join(res["continuing_themes"]))
+    st.markdown(f"**Technology relevance:** {res['technology_relevance']}")
+    st.markdown(f"**Should the earlier assessment be revisited?** {res['effect_on_assessment']}")
+    with st.expander(f"Differences in detail ({len(res['changes'])})"):
+        st.caption(f"Compared: pages 1–{s['old_pages_sent']} of {s['old_pages']} (previous edition) and "
+                   f"pages 1–{s['new_pages_sent']} of {s['new_pages']} (new edition). \"Removed\" means not "
+                   "addressed in the compared pages of the new edition, not necessarily absent from it.")
+        render_change_list(res["changes"], {"old": ("previous edition", prev_pdf),
+                                            "new": ("new edition", new_pdf)})
 
 
 for r in shown:
@@ -189,10 +289,10 @@ for r in shown:
         meta = [r["publisher"] or r["source_name"], authors or None,
                 (r["published"] or "")[:10] or None, r["source_kind"], r["version"]]
         head.caption(" · ".join(m for m in meta if m))
-        links.link_button("Open original source ↗", r["url"], use_container_width=True)
+        links.link_button("Open original source ↗", r["url"], width="stretch")
         pdf_url = r["doc_pdf_url"] or r["pdf_url"]
         if pdf_url:
-            links.link_button("PDF ↗", pdf_url, use_container_width=True)
+            links.link_button("PDF ↗", pdf_url, width="stretch")
 
         # Evidence flags about the source metadata itself
         flags = []
@@ -265,6 +365,12 @@ for r in shown:
         if r["item_id"] in revised:
             st.divider()
             render_versions(r["item_id"])
+        if r["item_id"] in editions:
+            st.divider()
+            render_edition(editions[r["item_id"]], r["doc_pdf_url"] or r["pdf_url"])
+        if r["item_id"] in newer_edition and newer_edition[r["item_id"]] in by_id:
+            newer = by_id[newer_edition[r["item_id"]]]
+            st.caption(f"📚 A newer edition is in the inbox: **{newer['title']}**")
 
         if flags:
             st.warning("Evidence check: " + "; ".join(flags))

@@ -51,7 +51,8 @@ def canonical_url(url: str) -> str:
     parts = urlsplit(url.strip())
     query = [(k, v) for k, v in parse_qsl(parts.query) if not TRACKING_PARAMS.match(k)]
     scheme = "https" if parts.scheme in ("http", "https") else parts.scheme
-    return urlunsplit((scheme, parts.netloc.lower(), parts.path, urlencode(query), ""))
+    path = re.sub(r"/{2,}", "/", parts.path)          # "europa.eu//press/…" -> "europa.eu/press/…"
+    return urlunsplit((scheme, parts.netloc.lower(), path, urlencode(query), ""))
 
 
 def strip_html(text: str) -> str:
