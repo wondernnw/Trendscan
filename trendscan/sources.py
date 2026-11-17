@@ -132,6 +132,16 @@ def fetch_source(source: dict, timeout: int = 30) -> list[Item]:
     return [i for i in items if i.url and i.title]
 
 
+def fetch_arxiv_latest(arxiv_ids: list[str], source: dict, timeout: int = 30) -> list[Item]:
+    """Ask the arXiv API for the current version of known papers (one request for up to 50 ids)."""
+    resp = requests.get("https://export.arxiv.org/api/query",
+                        params={"id_list": ",".join(arxiv_ids), "max_results": len(arxiv_ids)},
+                        timeout=timeout, headers={"User-Agent": USER_AGENT})
+    resp.raise_for_status()
+    entries = feedparser.parse(resp.content).entries
+    return [normalize_arxiv(e, source) for e in entries if e.get("title")]
+
+
 def _publisher_from_feed(title: str) -> str:
     # "Artificial intelligence – MIT Technology Review" -> "MIT Technology Review"
     for sep in (" – ", " - ", " | "):
